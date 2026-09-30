@@ -35,6 +35,10 @@ import alertRulesRoutes from "./routes/alert-rules-routes.js";
 import aiRoutes from "../ai/index.js";
 import automationsRoutes from "./routes/automations.js";
 import syncRoutes from "./routes/sync.js";
+import {
+  centralSyncWriteThrough,
+  getCentralSync,
+} from "./central-sync-runtime.js";
 import pluginApiRoutes from "./routes/plugin-api-routes.js";
 import { createCorsMiddleware } from "../utils/cors-config.js";
 import { createCompressionMiddleware } from "../utils/compression-config.js";
@@ -269,6 +273,8 @@ app.use((_req, res, next) => {
   res.setHeader("Cache-Control", "no-store");
   next();
 });
+// Per-user satellite mode: entry writes go through the central server.
+app.use(centralSyncWriteThrough());
 
 /**
  * @openapi
@@ -1778,6 +1784,21 @@ app.use("/secret-sources", secretSourceRoutes);
 app.use("/automations", automationsRoutes);
 app.use("/ai", aiRoutes);
 app.use("/", alertRulesRoutes);
+/**
+ * @openapi
+ * /sync/central-status:
+ *   get:
+ *     summary: Central sync status
+ *     description: Reports whether this instance mirrors a central Termix server, and the outcome of its last pull and push.
+ *     tags:
+ *       - Sync
+ *     responses:
+ *       200:
+ *         description: Central sync status, or enabled false when this instance runs standalone.
+ */
+app.get("/sync/central-status", authenticateJWT, (_req, res) => {
+  res.json(getCentralSync()?.getStatus() ?? { enabled: false });
+});
 app.use("/sync", syncRoutes);
 app.use("/plugin-api", pluginApiRoutes);
 

@@ -32,6 +32,17 @@ services:
       # TRUSTED_PROXY_AUTH_ROLE_MAP: '{"operators":["user"]}'
       # TRUSTED_PROXY_AUTH_USERNAME_HEADER: "x-forwarded-username"
       # TRUSTED_PROXY_AUTH_ROLE_HEADER: "x-forwarded-role"
+      # Per-user satellite mode: mirror one user's hosts, credentials,
+      # folders, snippets, vault profiles, dashboard links, homepage items and
+      # preferences from a central Termix server, which stays the source of
+      # truth. Creates, edits and deletes made here are forwarded to it before
+      # they succeed, and entries it does not have are removed from this
+      # instance. The API key is one created by that user on the central
+      # server. The local user defaults to the central account's username.
+      # CENTRAL_SERVER_URL: "https://termix.example.com"
+      # CENTRAL_SERVER_API_KEY: "tmx_..."
+      # CENTRAL_SYNC_LOCAL_USER: "alice"
+      # CENTRAL_SYNC_INTERVAL_SECONDS: "60"
     depends_on:
       - guacd
     networks:

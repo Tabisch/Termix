@@ -343,6 +343,10 @@ async function provisionLocalDesktopUserIfNeeded(): Promise<void> {
       await import("./automations/scheduler.js");
     startAutomationScheduler();
 
+    const { startCentralSync } =
+      await import("./database/central-sync-runtime.js");
+    startCentralSync();
+
     const { startAnalyticsHeartbeat } = await import("./utils/analytics.js");
     startAnalyticsHeartbeat();
 

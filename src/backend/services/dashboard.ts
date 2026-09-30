@@ -14,6 +14,7 @@ import {
 } from "../database/repositories/factory.js";
 import { DataCrypto } from "../utils/data-crypto.js";
 import { listenOnServicePort } from "../utils/service-listen.js";
+import { centralSyncWriteThrough } from "../database/central-sync-runtime.js";
 
 const app = express();
 app.set("trust proxy", "loopback");
@@ -38,6 +39,7 @@ app.use((_req, res, next) => {
 });
 
 app.use(authManager.createAuthMiddleware());
+app.use(centralSyncWriteThrough());
 
 /**
  * @openapi

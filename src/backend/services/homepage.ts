@@ -11,6 +11,7 @@ import { homepageFaviconRouter } from "../database/routes/homepage-favicon-route
 import { homepageRssRouter } from "../database/routes/homepage-rss-routes.js";
 import { homepagePingRouter } from "../database/routes/homepage-ping-routes.js";
 import { homepageProxyRouter } from "../database/routes/homepage-proxy-routes.js";
+import { centralSyncWriteThrough } from "../database/central-sync-runtime.js";
 
 const app = express();
 app.set("trust proxy", "loopback");
@@ -27,6 +28,7 @@ app.use((_req, res, next) => {
 });
 
 app.use(authManager.createAuthMiddleware());
+app.use(centralSyncWriteThrough());
 
 app.use("/homepage/items", homepageItemsRouter);
 app.use("/homepage/layout", homepageLayoutRouter);

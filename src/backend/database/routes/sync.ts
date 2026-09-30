@@ -1,5 +1,6 @@
 import express, { type Request, type Response } from "express";
-import { and, eq, type SQL } from "drizzle-orm";
+import { randomUUID } from "crypto";
+import { and, eq, isNull, type SQL } from "drizzle-orm";
 import {
   hosts,
   sshCredentials,
@@ -232,6 +233,182 @@ export function stripWritePayload(
   return clean;
 }
 
+class SyncValidationError extends Error {}
+
+/**
+ * Every row of an entity type the user owns, decrypted and with its
+ * references expressed as syncIds -- the wire form both sides of a sync pair
+ * exchange.
+ */
+export async function listSyncRows(
+  userId: string,
+  entityType: SyncEntityType,
+  since: string | null = null,
+): Promise<Record<string, unknown>[]> {
+  const { table, singleton } = ENTITY_CONFIG[entityType];
+  const context = createCurrentRepositoryContext();
+  const conditions = [eq(table.userId, userId)];
+  if (since && "updatedAt" in table) {
+    conditions.push(
+      timestampAtOrAfter((table as typeof hosts).updatedAt, since),
+    );
+  }
+
+  const rows = await context.drizzle
+    .select()
+    .from(table as typeof hosts)
+    .where(and(...conditions));
+
+  const serialized = await Promise.all(
+    rows.map(async (row) => {
+      const result = await serializeSyncReferences(
+        entityType,
+        decryptIfNeeded(entityType, row as Record<string, unknown>, userId),
+        (referenceType, id) =>
+          findReferenceSyncId(context, referenceType, id, userId),
+      );
+      return singleton
+        ? { ...result, syncId: `${entityType}:singleton` }
+        : result;
+    }),
+  );
+
+  return orderSyncRows(entityType, serialized);
+}
+
+/**
+ * Creates or updates the row a wire payload names by its syncId. Throws
+ * SyncValidationError for a payload the caller should reject as a bad request.
+ */
+export async function upsertSyncRow(
+  userId: string,
+  entityType: SyncEntityType,
+  payload: Record<string, unknown>,
+): Promise<{ row: Record<string, unknown>; created: boolean }> {
+  const syncId = payload.syncId;
+  if (typeof syncId !== "string" || !syncId) {
+    throw new SyncValidationError("Missing row.syncId");
+  }
+
+  // singleton is still needed below: those tables have no sync_id column
+  // for the insert to populate.
+  const { table, singleton } = ENTITY_CONFIG[entityType];
+  const context = createCurrentRepositoryContext();
+
+  const locateRow = locateSyncRow(entityType, userId, syncId);
+
+  const existingRows = await context.drizzle
+    .select()
+    .from(table as typeof hosts)
+    .where(locateRow)
+    .limit(1);
+  const existing = existingRows[0] as Record<string, unknown> | undefined;
+
+  const resolvedPayload = await deserializeSyncReferences(
+    entityType,
+    payload,
+    (referenceType, referenceSyncId) =>
+      findReferenceId(context, referenceType, referenceSyncId, userId),
+  );
+  if (
+    entityType === "hosts" &&
+    typeof resolvedPayload.parentHostId === "number"
+  ) {
+    const parentError = await validateParentHostId(
+      userId,
+      typeof existing?.id === "number" ? existing.id : null,
+      resolvedPayload.parentHostId,
+    );
+    if (parentError) throw new SyncValidationError(parentError);
+  }
+  const writePayload = stripWritePayload(entityType, resolvedPayload);
+  const encryptedPayload = encryptIfNeeded(entityType, writePayload, userId);
+
+  let resultRow: Record<string, unknown>;
+  if (existing) {
+    const updatedRows = await context.drizzle
+      .update(table as typeof hosts)
+      .set(encryptedPayload)
+      .where(locateRow)
+      .returning();
+    resultRow = updatedRows[0] as Record<string, unknown>;
+  } else {
+    const insertedRows = await context.drizzle
+      .insert(table as typeof hosts)
+      .values(
+        (singleton
+          ? { ...encryptedPayload, userId }
+          : {
+              ...encryptedPayload,
+              userId,
+              syncId,
+            }) as typeof hosts.$inferInsert,
+      )
+      .returning();
+    resultRow = insertedRows[0] as Record<string, unknown>;
+  }
+
+  return {
+    row: decryptIfNeeded(entityType, resultRow, userId),
+    created: !existing,
+  };
+}
+
+/** Deletes the row a syncId names, if the user still has it. */
+export async function deleteSyncRow(
+  userId: string,
+  entityType: SyncEntityType,
+  syncId: string,
+): Promise<void> {
+  const { table } = ENTITY_CONFIG[entityType];
+  await createCurrentRepositoryContext()
+    .drizzle.delete(table as typeof hosts)
+    .where(locateSyncRow(entityType, userId, syncId));
+}
+
+/**
+ * Deletes every row the user owns that has not been given a syncId yet. Such
+ * a row has never been exchanged with anything, so it has no wire identity.
+ */
+export async function deleteRowsWithoutSyncId(
+  userId: string,
+  entityType: SyncEntityType,
+): Promise<void> {
+  const { table, singleton } = ENTITY_CONFIG[entityType];
+  if (singleton) return;
+  await createCurrentRepositoryContext()
+    .drizzle.delete(table as typeof hosts)
+    .where(
+      and(eq(table.userId, userId), isNull((table as typeof hosts).syncId)),
+    );
+}
+
+/**
+ * Gives every row the user owns that lacks a syncId a fresh one, so it can
+ * be exchanged. Rows created before sync existed, and a few tables whose
+ * create paths never set one, would otherwise be invisible to a sync peer.
+ */
+export async function assignMissingSyncIds(
+  userId: string,
+  entityType: SyncEntityType,
+): Promise<number> {
+  const { table, singleton } = ENTITY_CONFIG[entityType];
+  if (singleton) return 0;
+  const context = createCurrentRepositoryContext();
+  const typedTable = table as typeof hosts;
+  const rows = await context.drizzle
+    .select({ id: typedTable.id })
+    .from(typedTable)
+    .where(and(eq(typedTable.userId, userId), isNull(typedTable.syncId)));
+  for (const row of rows) {
+    await context.drizzle
+      .update(typedTable)
+      .set({ syncId: randomUUID() })
+      .where(eq(typedTable.id, row.id));
+  }
+  return rows.length;
+}
+
 /**
  * @openapi
  * /sync/{entityType}:
@@ -273,35 +450,8 @@ router.get(
         : null;
 
     try {
-      const { table, singleton } = ENTITY_CONFIG[entityType];
-      const context = createCurrentRepositoryContext();
-      const conditions = [eq(table.userId, userId)];
-      if (since && "updatedAt" in table) {
-        conditions.push(
-          timestampAtOrAfter((table as typeof hosts).updatedAt, since),
-        );
-      }
-
-      const rows = await context.drizzle
-        .select()
-        .from(table as typeof hosts)
-        .where(and(...conditions));
-
-      const decrypted = await Promise.all(
-        rows.map(async (row) => {
-          const result = await serializeSyncReferences(
-            entityType,
-            decryptIfNeeded(entityType, row as Record<string, unknown>, userId),
-            (referenceType, id) =>
-              findReferenceSyncId(context, referenceType, id, userId),
-          );
-          return singleton
-            ? { ...result, syncId: `${entityType}:singleton` }
-            : result;
-        }),
-      );
-
-      res.json({ rows: orderSyncRows(entityType, decrypted) });
+      const rows = await listSyncRows(userId, entityType, since);
+      res.json({ rows });
     } catch (err) {
       databaseLogger.error(`Failed to pull sync rows for ${entityType}`, err, {
         operation: "sync_pull",
@@ -345,12 +495,7 @@ router.post(
     }
 
     try {
-      const { table } = ENTITY_CONFIG[entityType];
-      const context = createCurrentRepositoryContext();
-
-      await context.drizzle
-        .delete(table as typeof hosts)
-        .where(locateSyncRow(entityType, userId, syncId));
+      await deleteSyncRow(userId, entityType, syncId);
 
       await createCurrentSyncTombstoneRepository().record(
         userId,
@@ -409,75 +554,15 @@ router.post(
     }
 
     try {
-      // singleton is still needed below: those tables have no sync_id column
-      // for the insert to populate.
-      const { table, singleton } = ENTITY_CONFIG[entityType];
-      const context = createCurrentRepositoryContext();
-
-      const locateRow = locateSyncRow(entityType, userId, syncId);
-
-      const existingRows = await context.drizzle
-        .select()
-        .from(table as typeof hosts)
-        .where(locateRow)
-        .limit(1);
-      const existing = existingRows[0] as Record<string, unknown> | undefined;
-
-      const resolvedPayload = await deserializeSyncReferences(
-        entityType,
-        payload,
-        (referenceType, referenceSyncId) =>
-          findReferenceId(context, referenceType, referenceSyncId, userId),
-      );
-      if (
-        entityType === "hosts" &&
-        typeof resolvedPayload.parentHostId === "number"
-      ) {
-        const parentError = await validateParentHostId(
-          userId,
-          typeof existing?.id === "number" ? existing.id : null,
-          resolvedPayload.parentHostId,
-        );
-        if (parentError) return res.status(400).json({ error: parentError });
-      }
-      const writePayload = stripWritePayload(entityType, resolvedPayload);
-      const encryptedPayload = encryptIfNeeded(
-        entityType,
-        writePayload,
-        userId,
-      );
-
-      let resultRow: Record<string, unknown>;
-      if (existing) {
-        const updatedRows = await context.drizzle
-          .update(table as typeof hosts)
-          .set(encryptedPayload)
-          .where(locateRow)
-          .returning();
-        resultRow = updatedRows[0] as Record<string, unknown>;
-      } else {
-        const insertedRows = await context.drizzle
-          .insert(table as typeof hosts)
-          .values(
-            (singleton
-              ? { ...encryptedPayload, userId }
-              : {
-                  ...encryptedPayload,
-                  userId,
-                  syncId,
-                }) as typeof hosts.$inferInsert,
-          )
-          .returning();
-        resultRow = insertedRows[0] as Record<string, unknown>;
-      }
+      const { row, created } = await upsertSyncRow(userId, entityType, payload);
 
       await DatabaseSaveTrigger.forceSave("sync_upsert");
 
-      res.json({
-        row: decryptIfNeeded(entityType, resultRow, userId),
-        created: !existing,
-      });
+      res.json({ row, created });
     } catch (err) {
+      if (err instanceof SyncValidationError) {
+        return res.status(400).json({ error: err.message });
+      }
       databaseLogger.error(`Failed to upsert sync row for ${entityType}`, err, {
         operation: "sync_upsert",
         entityType,
